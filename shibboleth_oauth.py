@@ -5,7 +5,6 @@ from jupyterhub.auth import Authenticator, LocalAuthenticator
 from jupyterhub.handlers import BaseHandler
 from traitlets import Unicode, List, validate, TraitError
 from tornado import web
-from oauthenticator.generic import GenericOAuthenticator
 from oauthenticator.oauth2 import OAuthLoginHandler
 from oauthenticator.oauth2 import OAuthenticator
 
