@@ -1,1 +1,1 @@
-import ShibbolethClerkLoginHandler, ShibbolethClerkAuthenticator from shibboleth_clerk
+from shibboleth_clerk import ShibbolethClerkLoginHandler, ShibbolethClerkLogoutHandler, ShibbolethClerkAuthenticator
