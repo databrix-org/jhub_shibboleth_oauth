@@ -8,34 +8,27 @@ from tornado import web
 from oauthenticator.oauth2 import OAuthLoginHandler
 from oauthenticator.oauth2 import OAuthenticator
 
-def _serialize_state(state):
+def serialize_state(state):
     """Serialize OAuth state to a base64 string after passing through JSON"""
     json_state = json.dumps(state)
     return base64.urlsafe_b64encode(json_state.encode("utf8")).decode("ascii")
 
 class ShibbolethClerkLoginHandler(OAuthLoginHandler):
+
     def _get_user_data_from_request(self):
         """Get shibboleth attributes (user data) from request headers."""
-        # print('HEADERS:', self.request.headers)
-        # NOTE: The Persistent ID is a triple with the format:
-        # <name for the source of the identifier>!
-        # <name for the intended audience of the identifier >!
-        # <opaque identifier for the principal >
-        user_data = {}
-        for i, header in enumerate(self.authenticator.headers):
-            value = self.request.headers.get(header, "")
-            if value:
-                try:
-                    # sometimes header value is in latin-1 encoding
-                    # TODO what causes this? fix encoding in there
-                    value = value.encode('latin-1').decode('utf-8')
-                except UnicodeDecodeError:
-                    pass
-                user_data[header] = value
-                if i == 0:
-                    user_data['jh_name'] = value
-        return user_data
+        user_data = {'shibboleth':False}
+        value_list = [self.request.headers.get(header, "") for header in self.authenticator.headers]
 
+        self.log.info("User data debug: %s", (value_list) )
+
+        if value_list[0]:
+                user_data['jh_name'] = value_list[0]
+                user_data['shibboleth'] = True
+        self.log.info("User data debug: %s", user_data)
+
+        return user_data
+    
     async def get(self):
         """Get user data and log user in."""
         self.statsd.incr('login.request')
@@ -61,7 +54,6 @@ class ShibbolethClerkLoginHandler(OAuthLoginHandler):
 
             authorize_state = _serialize_state({"state_id": state_id})
             token_params["state"] = authorize_state
-
             self.authorize_redirect(
                 redirect_uri=redirect_uri,
                 client_id=self.authenticator.client_id,
@@ -70,7 +62,25 @@ class ShibbolethClerkLoginHandler(OAuthLoginHandler):
                 response_type="code",
             )
 
+class ShibbolethClerkLogoutHandler(OAuthLogoutHandler):
+    """Log a user out from JupyterHub by clearing their login cookie
+    and then redirect to shibboleth logout url to clear shibboleth cookie."""
+
+    async def get(self):
+        user = await self.get_current_user()
+
+        self.log.info("User logged out: %s", user.name)
+        await self.default_handle_logout()
+        await self.handle_logout()
+        self._jupyterhub_user = None
+        if user.name.startswith('shibboleth'):
+            self.redirect(self.authenticator.shibboleth_logout_url)
+        else:
+            self.redirect("https://databrix.org")
+
 class ShibbolethClerkAuthenticator(OAuthenticator):
+
+    manage_groups = True
 
     headers = List(
         default_value=['mail'],
@@ -82,8 +92,40 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
         config=True,
         help="""Url to logout from shibboleth SP.""")
 
-
     login_handler = ShibbolethClerkLoginHandler
+    logout_handler = ShibbolethClerkLogoutHandler
+
+    def _write_user_name_in_json(self,username_dict,username):
+
+        idname = ''
+
+        for k,v in username_dict['student'].items():
+            if len(v['mail']) < 1:
+                username_dict['student'][k]['mail'] = username
+                idname = k
+                break
+
+        with open('/srv/ngshare/dhbw-user-info.json', 'w') as file:
+            json.dump(username_dict, file)
+
+        return idname
+
+    def _convert_username_to_id(self, username_dict, username):
+
+        userid_dict_student = {v['mail']:k for k,v in username_dict['student'].items()}
+        userid_dict_dozent = {v['mail']:k for k,v in username_dict['dozent'].items()}
+
+        '''set admin user for shibboleth'''
+        #if username in ['gu@lehre.dhbw-stuttgart.de']:
+            #return username
+
+        if username in userid_dict_dozent.keys():
+            return userid_dict_dozent[username], 'dozent'
+
+        if username in userid_dict_student.keys():
+            return userid_dict_student[username], 'student'
+        else:
+            return self._write_user_name_in_json(username_dict,username), 'student'
 
     @validate('headers')
     def _valid_headers(self, proposal):
@@ -91,18 +133,28 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
             raise TraitError('Headers should contain at least 1 item.')
         return proposal['value']
 
+    def login_url(self, base_url):
+        return url_path_join(base_url, "login")
+
     async def authenticate(self, handler, data):
+
+        with open('/srv/ngshare/dhbw-user-info.json', 'r') as file:
+            username_dict = json.load(file)
+
         try:
+            check = data['shibboleth']
+            username, rolle = self._convert_username_to_id(username_dict, data['jh_name'])
+            jhname = 'shibboleth-' + username
             user_data = {
-                  'name': data['jh_name'],
-                  'auth_state': data
+                  'name': jhname,
+                  'auth_state': data,
+                  'groups': username_dict[rolle][username]['group']
                   }
             return user_data
+
         except:
             access_token_params = self.build_access_tokens_request_params(handler, data)
-
             token_info = await self.get_token_info(handler, access_token_params)
-
             user_info = await self.token_to_user(token_info)
 
             username = self.user_info_to_username(user_info)
@@ -118,15 +170,16 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
                     token_info["refresh_token"] = refresh_token
 
             auth_model = {
-                "name": username,
+                "name": 'clerk-'+username,
                 "admin": True if username in self.admin_users else None,
                 "auth_state": self.build_auth_state_dict(token_info, user_info),
+                "groups" : [user_info.get('public_metadata')['rolle']]
             }
 
             return await self.update_auth_model(auth_model)
 
     def get_handlers(self, app):
         return [ (r'/oauth_callback',self.callback_handler),
-                 #(r'/logout',self.logout_handler),
-                 (r'/login', ShibbolethClerkLoginHandler),
+                 (r'/logout',self.logout_handler),
+                 (r'/login', self.login_handler),
                ]
