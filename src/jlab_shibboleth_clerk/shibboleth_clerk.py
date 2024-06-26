@@ -8,13 +8,14 @@ from tornado import web
 from oauthenticator.oauth2 import OAuthLoginHandler
 from oauthenticator.oauth2 import OAuthenticator
 
-def serialize_state(state):
-    """Serialize OAuth state to a base64 string after passing through JSON"""
-    json_state = json.dumps(state)
-    return base64.urlsafe_b64encode(json_state.encode("utf8")).decode("ascii")
 
 class ShibbolethClerkLoginHandler(OAuthLoginHandler):
 
+    def _serialize_state(state):
+        """Serialize OAuth state to a base64 string after passing through JSON"""
+        json_state = json.dumps(state)
+        return base64.urlsafe_b64encode(json_state.encode("utf8")).decode("ascii")
+    
     def _get_user_data_from_request(self):
         """Get shibboleth attributes (user data) from request headers."""
         user_data = {'shibboleth':False}
@@ -26,9 +27,8 @@ class ShibbolethClerkLoginHandler(OAuthLoginHandler):
                 user_data['jh_name'] = value_list[0]
                 user_data['shibboleth'] = True
         self.log.info("User data debug: %s", user_data)
-
         return user_data
-    
+
     async def get(self):
         """Get user data and log user in."""
         self.statsd.incr('login.request')
@@ -76,11 +76,11 @@ class ShibbolethClerkLogoutHandler(OAuthLogoutHandler):
         if user.name.startswith('shibboleth'):
             self.redirect(self.authenticator.shibboleth_logout_url)
         else:
-            self.redirect("https://databrix.org")
+            self.redirect(self.authenticator.clerk_logout_url)
 
 class ShibbolethClerkAuthenticator(OAuthenticator):
 
-    manage_groups = True
+    manage_groups = False
 
     headers = List(
         default_value=['mail'],
@@ -91,41 +91,14 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
         default_value='',
         config=True,
         help="""Url to logout from shibboleth SP.""")
+    
+    clerk_logout_url = Unicode(
+        default_value='"https://databrix.org"',
+        config=True,
+        help="""Url to logout from Clerk.""")
 
     login_handler = ShibbolethClerkLoginHandler
     logout_handler = ShibbolethClerkLogoutHandler
-
-    def _write_user_name_in_json(self,username_dict,username):
-
-        idname = ''
-
-        for k,v in username_dict['student'].items():
-            if len(v['mail']) < 1:
-                username_dict['student'][k]['mail'] = username
-                idname = k
-                break
-
-        with open('/srv/ngshare/dhbw-user-info.json', 'w') as file:
-            json.dump(username_dict, file)
-
-        return idname
-
-    def _convert_username_to_id(self, username_dict, username):
-
-        userid_dict_student = {v['mail']:k for k,v in username_dict['student'].items()}
-        userid_dict_dozent = {v['mail']:k for k,v in username_dict['dozent'].items()}
-
-        '''set admin user for shibboleth'''
-        #if username in ['gu@lehre.dhbw-stuttgart.de']:
-            #return username
-
-        if username in userid_dict_dozent.keys():
-            return userid_dict_dozent[username], 'dozent'
-
-        if username in userid_dict_student.keys():
-            return userid_dict_student[username], 'student'
-        else:
-            return self._write_user_name_in_json(username_dict,username), 'student'
 
     @validate('headers')
     def _valid_headers(self, proposal):
@@ -138,17 +111,14 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
 
     async def authenticate(self, handler, data):
 
-        with open('/srv/ngshare/dhbw-user-info.json', 'r') as file:
-            username_dict = json.load(file)
 
         try:
             check = data['shibboleth']
-            username, rolle = self._convert_username_to_id(username_dict, data['jh_name'])
+            username = data['jh_name']
             jhname = 'shibboleth-' + username
             user_data = {
                   'name': jhname,
-                  'auth_state': data,
-                  'groups': username_dict[rolle][username]['group']
+                  'auth_state': data
                   }
             return user_data
 
@@ -172,8 +142,7 @@ class ShibbolethClerkAuthenticator(OAuthenticator):
             auth_model = {
                 "name": 'clerk-'+username,
                 "admin": True if username in self.admin_users else None,
-                "auth_state": self.build_auth_state_dict(token_info, user_info),
-                "groups" : [user_info.get('public_metadata')['rolle']]
+                "auth_state": self.build_auth_state_dict(token_info, user_info)
             }
 
             return await self.update_auth_model(auth_model)
